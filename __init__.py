@@ -55,9 +55,44 @@ MODIFIER_KEYWORDS = {
 
 # 박사님 개인 워크플로우 용어를 여기 채워서 쓰면 됨 (기본은 비워둠, CORE와 같은 우선순위로 취급)
 PERSONAL_KEYWORDS = {
+    "땡땡이": ["dots"],
     # "나뭇결": ["wood_grain", "grunge_lac"],
     # "틈새": ["cavity"],
 }
+
+# Fill 레이어가 단일 채널만 채울 때 사용할 이름 매핑
+# (ChannelType enum의 .name 속성 기준, 소문자로 비교)
+CHANNEL_LABELS = {
+    "basecolor": "베이스",
+    "diffuse": "베이스",
+    "roughness": "러프니스",
+    "glossiness": "러프니스",
+    "metallic": "메탈릭",
+    "normal": "노말",
+    "height": "하이트",
+    "opacity": "오퍼시티",
+    "emissive": "이미시브",
+    "specular": "스페큘러",
+}
+
+
+def get_fill_channel_label(node):
+    """Fill 레이어가 채우는 채널이 딱 하나면 그 채널 이름을, 여러 개거나 알 수 없으면 '베이스'를 반환"""
+    try:
+        channels = node.active_channels
+    except Exception:
+        return "베이스"
+
+    if not channels or len(channels) != 1:
+        return "베이스"
+
+    channel = next(iter(channels))
+    try:
+        key = channel.name.lower()
+    except Exception:
+        return "베이스"
+
+    return CHANNEL_LABELS.get(key, "베이스")
 
 # 폴백 이름 정리 시 제거할 흔한 접두어/잡음 토큰
 NOISE_TOKENS = ["mg", "sp", "map", "generator", "filter"]
@@ -171,9 +206,11 @@ def classify_node(node, log_widget):
     elif fallback_labels:
         primary = fallback_labels[0]
     else:
-        # 이펙트를 하나도 못 찾음 -> 마스크 유무 상관없이 베이스로 간주
+        # 이펙트를 하나도 못 찾음 -> 마스크 유무 상관없이 베이스 계열로 간주
+        # 단, Fill 레이어가 어느 채널을 채우는지에 따라 이름을 다르게 붙임
+        # (예: 러프니스만 켜진 Fill이면 "베이스"가 아니라 "러프니스")
         if node_type == ls.NodeType.FillLayer:
-            return ["베이스"]
+            return [get_fill_channel_label(node)]
         return []
 
     # 이펙트가 딱 1개면 이름 그대로, 2개 이상이면 "~활용"으로 표시
@@ -185,10 +222,32 @@ def classify_node(node, log_widget):
 # ---------------------------------------------------------------------------
 # 3. 전체 레이어 일괄 처리 (export 없이 메타데이터만 조회하므로 매우 빠름)
 # ---------------------------------------------------------------------------
-def process_all_layers(log_widget, dry_run=True):
+def get_selected_uids(stack):
+    """현재 레이어 패널에서 선택된 레이어들의 uid 집합을 반환.
+    선택된 게 폴더면 그 안의 하위 레이어까지 전부 포함시킴."""
+    try:
+        selected = ls.get_selected_nodes(stack)
+    except Exception:
+        return set()
+    expanded = get_all_nodes(selected)  # 폴더 선택 시 하위 레이어까지 펼침
+    uids = set()
+    for n in expanded:
+        try:
+            uids.add(n.uid())
+        except Exception:
+            pass
+    return uids
+
+
+def process_all_layers(log_widget, dry_run=True, selection_mode="all"):
     """
     dry_run=True  : 실제로 이름을 바꾸지 않고 로그에만 "이렇게 바뀔 예정"을 출력
     dry_run=False : 실제로 node.set_name()까지 적용
+
+    selection_mode:
+        "all"              : 전체 레이어 대상
+        "selected_only"    : 현재 선택된 레이어(및 그 하위)만 대상
+        "exclude_selected" : 현재 선택된 레이어(및 그 하위)를 제외한 나머지 전부
     """
     if not substance_painter.project.is_open():
         log_widget.append("프로젝트가 열려있지 않습니다.")
@@ -198,12 +257,27 @@ def process_all_layers(log_widget, dry_run=True):
     root_nodes = ls.get_root_layer_nodes(stack)
     all_nodes = get_all_nodes(root_nodes)
 
+    if selection_mode != "all":
+        selected_uids = get_selected_uids(stack)
+        if not selected_uids:
+            log_widget.append("선택된 레이어가 없습니다. 레이어 패널에서 먼저 선택해주세요.")
+            return
+        if selection_mode == "selected_only":
+            all_nodes = [n for n in all_nodes if n.uid() in selected_uids]
+        elif selection_mode == "exclude_selected":
+            all_nodes = [n for n in all_nodes if n.uid() not in selected_uids]
+
     if not all_nodes:
-        log_widget.append("레이어가 없습니다.")
+        log_widget.append("처리 대상 레이어가 없습니다.")
         return
 
     mode_text = "미리보기 (실제 변경 없음)" if dry_run else "실제 적용"
-    log_widget.append("총 {}개 레이어 처리 시작... [{}]".format(len(all_nodes), mode_text))
+    scope_text = {
+        "all": "전체 레이어",
+        "selected_only": "선택한 레이어만",
+        "exclude_selected": "선택한 레이어 제외",
+    }.get(selection_mode, "전체 레이어")
+    log_widget.append("총 {}개 레이어 처리 시작... [{} / {}]".format(len(all_nodes), scope_text, mode_text))
     QtWidgets.QApplication.processEvents()
 
     start_time = time.time()
@@ -250,17 +324,40 @@ def _build_panel():
     panel.setWindowTitle("Layer Organizer")
     layout = QtWidgets.QVBoxLayout(panel)
 
+    # 처리 범위 선택 (전체 / 선택한 레이어만 / 선택한 레이어 제외)
+    scope_group = QtWidgets.QGroupBox("처리 범위")
+    scope_layout = QtWidgets.QVBoxLayout(scope_group)
+    radio_all = QtWidgets.QRadioButton("전체 레이어")
+    radio_selected_only = QtWidgets.QRadioButton("선택한 레이어만")
+    radio_exclude_selected = QtWidgets.QRadioButton("선택한 레이어 제외")
+    radio_all.setChecked(True)
+    scope_layout.addWidget(radio_all)
+    scope_layout.addWidget(radio_selected_only)
+    scope_layout.addWidget(radio_exclude_selected)
+
+    def get_selection_mode():
+        if radio_selected_only.isChecked():
+            return "selected_only"
+        if radio_exclude_selected.isChecked():
+            return "exclude_selected"
+        return "all"
+
     preview_button = QtWidgets.QPushButton("미리보기 (이름 변경 없이 확인만)")
     apply_button = QtWidgets.QPushButton("실제 이름 적용")
     log_widget = QtWidgets.QTextEdit()
     log_widget.setReadOnly(True)
 
+    layout.addWidget(scope_group)
     layout.addWidget(preview_button)
     layout.addWidget(apply_button)
     layout.addWidget(log_widget)
 
-    preview_button.clicked.connect(lambda: process_all_layers(log_widget, dry_run=True))
-    apply_button.clicked.connect(lambda: process_all_layers(log_widget, dry_run=False))
+    preview_button.clicked.connect(
+        lambda: process_all_layers(log_widget, dry_run=True, selection_mode=get_selection_mode())
+    )
+    apply_button.clicked.connect(
+        lambda: process_all_layers(log_widget, dry_run=False, selection_mode=get_selection_mode())
+    )
 
     substance_painter.ui.add_dock_widget(panel)
     plugin_widgets.append(panel)
