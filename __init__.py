@@ -56,8 +56,8 @@ MODIFIER_KEYWORDS = {
 # 박사님 개인 워크플로우 용어를 여기 채워서 쓰면 됨 (기본은 비워둠, CORE와 같은 우선순위로 취급)
 PERSONAL_KEYWORDS = {
     "땡땡이": ["dots"],
-    # "나뭇결": ["wood_grain", "grunge_lac"],
-    # "틈새": ["cavity"],
+    "나뭇결": ["alpha_wood"],
+    # "틈새": ["cavity"],  # 리소스 확인 후 추가 예정
 }
 
 # Fill 레이어가 단일 채널만 채울 때 사용할 이름 매핑
@@ -136,6 +136,49 @@ def classify_resource_name(resource_name):
 
 
 # ---------------------------------------------------------------------------
+# 0.5 파라미터 기반 세분화 (같은 리소스를 파라미터만 다르게 쓰는 경우 구분)
+#     예: 라이트 방향(상단/하단), 커버쳐 폭(넓은/얇은)
+# ---------------------------------------------------------------------------
+def refine_light(params):
+    v = params.get("Vertical_Angle")
+    if v is None:
+        return None
+    return "상단라이트" if v < 0.5 else "하단라이트"
+
+
+def refine_curvature(params):
+    balance = params.get("global_balance")
+    if balance is None:
+        return None
+    invert = params.get("global_invert", 0)
+    effective = balance if not invert else (1 - balance)
+    return "얇은엣지" if effective > 0.5 else "넓은엣지"
+
+
+def refine_dots_by_brightness(node):
+    """땡땡이 레이어 자체의 Base Color 균일색을 보고 밝은/어두운으로 세분화.
+    마스크 이펙트 파라미터가 아니라 레이어 본인의 색상을 봐야 하는 특수 케이스."""
+    try:
+        src = node.get_source(ts.ChannelType.BaseColor)
+        color = src.get_color()
+        r, g, b = color.value
+        v = max(r, g, b)  # HSV의 V값과 동일
+        return "밝은땡땡이" if v >= 0.5 else "어두운땡땡이"
+    except Exception:
+        return None
+
+
+# 코어 라벨 이름 -> 세분화 함수 매핑 (파라미터 딕셔너리를 받는 것들)
+REFINEMENT_FUNCS = {
+    "라이트": refine_light,
+    "커버쳐": refine_curvature,
+}
+
+# 이미 세분화되어 그 자체로 완결된 이름들 (뒤에 "활용" 접미사를 붙이지 않음)
+REFINED_LABELS = {"상단라이트", "하단라이트", "넓은엣지", "얇은엣지", "밝은땡땡이", "어두운땡땡이"}
+
+
+# ---------------------------------------------------------------------------
 # 1. 레이어 트리 순회
 # ---------------------------------------------------------------------------
 def get_all_nodes(nodes):
@@ -178,43 +221,82 @@ def classify_node(node, log_widget):
 
     total_effect_count = len(effects)  # Levels 같은 리소스 없는 조정 이펙트도 "추가로 뭔가 얹었다"는 신호로 셈
 
-    core_labels = []
-    modifier_labels = []
-    fallback_labels = []
+    core_items = []      # [(label, params)]
+    modifier_items = []
+    fallback_items = []
+    curvature_blend_modes = []  # 넓은면적 판별용: 커버쳐 이펙트들의 블렌드 모드 문자열
+    has_paint_effect = False  # 손으로 직접 칠한 이펙트가 섞여 있는지
 
     for eff in effects:
+        if type(eff).__name__ == "PaintEffectNode":
+            has_paint_effect = True
+
         try:
             src = eff.get_source()  # 마스크 안이라 mono channel이라 인자 불필요
             if not (src and src.resource_id):
                 continue
             tier, label = classify_resource_name(src.resource_id.name)
-            if tier == "core" and label not in core_labels:
-                core_labels.append(label)
-            elif tier == "modifier" and label not in modifier_labels:
-                modifier_labels.append(label)
-            elif tier == "fallback" and label not in fallback_labels:
-                fallback_labels.append(label)
+
+            params = {}
+            try:
+                params = src.get_parameters()
+            except Exception:
+                params = {}
+
+            if label == "커버쳐":
+                try:
+                    bmode = str(eff.get_blending_mode())
+                except Exception:
+                    bmode = ""
+                curvature_blend_modes.append(bmode)
+
+            if tier == "core":
+                core_items.append((label, params))
+            elif tier == "modifier":
+                modifier_items.append((label, params))
+            elif tier == "fallback":
+                fallback_items.append((label, params))
         except Exception:
             # 이펙트 종류에 따라 get_source가 없을 수 있음 (예: PaintEffectNode, Levels 등 조정 이펙트)
             continue
 
+    # 특수 케이스: 커버쳐 이펙트가 2개 이상이고 그 중 하나가 Sub(빼기) 블렌드 모드
+    # -> "넓은 커버쳐 - 얇은 커버쳐"로 넓은 면적만 남기는 구성으로 간주
+    if len(curvature_blend_modes) >= 2 and any("sub" in m.lower() for m in curvature_blend_modes):
+        return ["넓은면적"]
+
     # 대표 라벨 선정: core > modifier > fallback 우선순위
-    if core_labels:
-        primary = core_labels[0]
-    elif modifier_labels:
-        primary = modifier_labels[0]
-    elif fallback_labels:
-        primary = fallback_labels[0]
+    if core_items:
+        primary, primary_params = core_items[0]
+    elif modifier_items and not has_paint_effect:
+        # 손으로 직접 칠한 이펙트가 섞여 있으면, 남은 보정 필터(블러 등)만 보고
+        # 대표 이름을 정하는 건 오분류 위험이 크므로 이 경우엔 건드리지 않음
+        primary, primary_params = modifier_items[0]
+    elif fallback_items and not has_paint_effect:
+        primary, primary_params = fallback_items[0]
     else:
-        # 이펙트를 하나도 못 찾음 -> 마스크 유무 상관없이 베이스 계열로 간주
+        # 이펙트를 하나도 못 찾음(또는 손칠만 있음) -> 마스크 유무 상관없이 베이스 계열로 간주
         # 단, Fill 레이어가 어느 채널을 채우는지에 따라 이름을 다르게 붙임
         # (예: 러프니스만 켜진 Fill이면 "베이스"가 아니라 "러프니스")
-        if node_type == ls.NodeType.FillLayer:
+        if not has_paint_effect and node_type == ls.NodeType.FillLayer:
             return [get_fill_channel_label(node)]
         return []
 
+    # 같은 리소스를 파라미터만 다르게 쓰는 경우 세분화 (라이트: 상단/하단, 커버쳐: 넓은/얇은)
+    refine_func = REFINEMENT_FUNCS.get(primary)
+    if refine_func:
+        refined = refine_func(primary_params)
+        if refined:
+            primary = refined
+    elif primary == "땡땡이":
+        # 이건 이펙트 파라미터가 아니라 레이어 자체의 Base Color를 봐야 하는 특수 케이스
+        refined = refine_dots_by_brightness(node)
+        if refined:
+            primary = refined
+
     # 이펙트가 딱 1개면 이름 그대로, 2개 이상이면 "~활용"으로 표시
-    if total_effect_count > 1:
+    # 단, 이미 세분화된 이름(상단라이트 등)은 그 자체로 완결된 이름이므로 접미사를 붙이지 않음
+    if total_effect_count > 1 and primary not in REFINED_LABELS:
         return ["{}활용".format(primary)]
     return [primary]
 
